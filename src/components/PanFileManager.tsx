@@ -102,8 +102,9 @@ export default function PanFileManager({
     if (playingFid || !isVideoFile(file.fname)) return;
     setPlayingFid(file.fid);
     try {
+      toast.success("高速下载缓冲中，稍后自动打开播放器…");
       const result = await ipc.playPersonalFile(platform, file);
-      toast.success(`原画播放中（${result.player}）`);
+      toast.success(`已开播（${result.player}），后台继续下载`);
     } catch (e) {
       toast.error(errMsg(e));
     } finally {

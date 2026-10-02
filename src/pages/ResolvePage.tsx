@@ -396,13 +396,14 @@ export default function ResolvePage({ onNavigate, pending, onPendingConsumed }: 
     }
   }
 
-  // 原画边下边播：取链 → GeZi 本地代理 → VLC
+  // 原画播放：aria2 高速下 → 缓冲够了开本地播放器（下到哪播到哪）
   async function playFile(file: ShareFile) {
     if (!session || playingFid.has(file.fid) || !isVideoFile(file.fname)) return;
     setPlayingFid((prev) => new Set(prev).add(file.fid));
     try {
+      showNotice("高速下载缓冲中，稍后自动打开播放器…");
       const result = await ipc.playShareFile(session.sessionKey, file);
-      showNotice(`原画播放中（${result.player}）`);
+      showNotice(`已开播（${result.player}），后台继续下载`);
     } catch (e) {
       toast.error(errMsg(e));
     } finally {
