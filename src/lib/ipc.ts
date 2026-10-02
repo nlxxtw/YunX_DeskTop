@@ -17,6 +17,8 @@ export interface Settings {
   downloadRetryCount: number;
   downloadMinSplitMb: number;
   downloadConnPerServer: number;
+  /** 启用 HTTP/2 意图（aria2 映射为 HTTP 流水线） */
+  http2Enabled: boolean;
   pansouBaseUrl: string;
   /** 百度网盘加速通道（百度分享高速下载）：开关 */
   baiduSpeedEnabled: boolean;
@@ -63,6 +65,7 @@ export const DEFAULT_SETTINGS: Settings = {
   downloadRetryCount: 3,
   downloadMinSplitMb: 4,
   downloadConnPerServer: 16,
+  http2Enabled: false,
   pansouBaseUrl: "",
   baiduSpeedEnabled: false,
   baiduSpeedBaseUrl: "",
@@ -378,6 +381,9 @@ export const ipc = {
   pansouPing: (baseUrl: string) => invoke<PansouPingResult>("pansou_ping", { baseUrl }),
   webLoginStart: (platform: string) => invoke<void>("web_login_start", { platform }),
   webLoginCancel: (platform: string) => invoke<void>("web_login_cancel", { platform }),
+  /** 手动粘贴 Cookie 登录（夸克/UC/百度/139） */
+  importCookieLogin: (platform: string, cookie: string) =>
+    invoke<string>("import_cookie_login", { platform, cookie }),
   xunleiLogin: (username: string, password: string) =>
     invoke<XunleiLoginStep>("xunlei_login", { username, password }),
   xunleiSmsLogin: (username: string, smsCode: string, creditKey: string, smsToken: string) =>

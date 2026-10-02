@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { open as openDialogDir } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
-import { Bell, Check, ChevronDown, ClipboardPaste, Download, ExternalLink, FolderOpen, Globe, Loader2, Magnet, Minimize2, Power, RefreshCw, Rss, Search, ShieldCheck, Wifi } from "lucide-react";
+import { Bell, Check, ChevronDown, ClipboardPaste, Download, ExternalLink, FolderOpen, Globe, Loader2, Magnet, Minimize2, Power, RefreshCw, Rss, Search, ShieldCheck, Wifi, Zap } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 import { errMsg, ipc, onSettingsUpdated, DEFAULT_SETTINGS, type AppInfo, type Settings as SettingsT } from "../lib/ipc";
 import { toast } from "../lib/toast";
@@ -529,6 +529,17 @@ export default function SettingsPage({ themeMode, colorTheme, onAppearanceChange
               value={s.downloadConnPerServer}
               onInput={(v) => setSettings({ ...s, downloadConnPerServer: v })}
               onCommit={(v) => persist({ ...s, downloadConnPerServer: v })}
+            />
+            <ToggleRow
+              icon={Zap}
+              title="启用 HTTP/2"
+              desc={
+                s.http2Enabled
+                  ? "已启用：aria2 使用 HTTP 流水线（对齐 Desktop；真 HTTP/2 需其它引擎）"
+                  : "已关闭：仅 HTTP/1.1（与 YunX-Desktop 默认一致）"
+              }
+              checked={s.http2Enabled}
+              onChange={(v) => persist({ ...s, http2Enabled: v })}
             />
             <div className="py-3">
               <dt className="text-xs text-ink-soft/70">

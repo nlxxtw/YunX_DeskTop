@@ -109,6 +109,7 @@ pub fn run() {
             commands::accounts::logout,
             commands::accounts::web_login_start,
             commands::accounts::web_login_cancel,
+            commands::accounts::import_cookie_login,
             commands::accounts::xunlei_login,
             commands::accounts::xunlei_sms_login,
             commands::accounts::pan123_login,

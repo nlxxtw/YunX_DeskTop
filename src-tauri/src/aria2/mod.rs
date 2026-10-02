@@ -57,6 +57,7 @@ async fn cleanup_transfer(state: &AppState, platform: &str, cleanup_id: &str) {
 }
 
 /// 将下载任务提交给 aria2 引擎（addUri → 回写 gid，不插入 DB）
+/// `play_mode`：按字节顺序灌盘，便于本地文件边下边播。
 async fn add_to_aria2(
     app: &AppHandle,
     id: i64,
@@ -67,6 +68,7 @@ async fn add_to_aria2(
     cleanup_id: &str,
     start_paused: bool,
     mirrors: Vec<String>,
+    play_mode: bool,
 ) -> AppResult<String> {
     let state = app.state::<AppState>();
     let settings = state.load_settings();
@@ -86,14 +88,18 @@ async fn add_to_aria2(
         header_list.push(format!("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"));
     }
 
-    // 针对百度及多镜像任务优化并发连接；夸克使用保守并发，避免 active 但 0 速度。
+    // 对齐 YunX-Desktop：夸克等平台用设置分片数；迅雷更保守。
     let (split, max_connections) = transfer_tuning(
         platform,
         settings.download_threads,
         settings.download_conn_per_server,
         mirror_count,
     );
-    let min_split = format!("{}M", settings.download_min_split_mb.clamp(1, 64));
+    let min_split = if play_mode {
+        "1M".to_string()
+    } else {
+        format!("{}M", settings.download_min_split_mb.clamp(1, 64))
+    };
 
     let is_magnet = url.starts_with("magnet:?");
     let mut options = if is_magnet {
@@ -104,7 +110,16 @@ async fn add_to_aria2(
             "seed-time": "0",
         })
     } else {
-        let extra = stall_guard_options(platform);
+        let mut extra = stall_guard_options(platform);
+        if play_mode {
+            extra.extend(play_stream_options());
+        }
+        if settings.http2_enabled {
+            // aria2 无真 HTTP/2；开关映射为 HTTP/1.1 流水线（与 Desktop 同款意图）
+            if !extra.iter().any(|(k, _)| k == "enable-http-pipelining") {
+                extra.push(("enable-http-pipelining".into(), "true".into()));
+            }
+        }
         http_task_options(
             &dir.display().to_string(),
             file_name,
@@ -137,7 +152,15 @@ async fn add_to_aria2(
         platform,
         "download",
         &format!("已加入下载：{file_name}"),
-        &format!("任务 #{id} gid={gid} split={split} 镜像源={mirror_count} {}", if cleanup_id.is_empty() { String::new() } else { format!("cleanup={cleanup_id}") }),
+        &format!(
+            "任务 #{id} gid={gid} split={split} 镜像源={mirror_count} play={} {}",
+            play_mode,
+            if cleanup_id.is_empty() {
+                String::new()
+            } else {
+                format!("cleanup={cleanup_id}")
+            }
+        ),
     );
     Ok(gid)
 }
@@ -153,6 +176,59 @@ pub async fn enqueue(
     start_paused: bool,
     mirrors: Vec<String>,
     fetch_ctx: &str,
+) -> AppResult<i64> {
+    enqueue_inner(
+        app,
+        url,
+        file_name,
+        headers,
+        platform,
+        cleanup_id,
+        start_paused,
+        mirrors,
+        fetch_ctx,
+        false,
+    )
+    .await
+}
+
+/// 入队并按播放模式灌盘（顺序写盘，便于缓冲后本地播放）
+pub async fn enqueue_for_play(
+    app: &AppHandle,
+    url: &str,
+    file_name: &str,
+    headers: &[(String, String)],
+    platform: &str,
+    cleanup_id: &str,
+    mirrors: Vec<String>,
+    fetch_ctx: &str,
+) -> AppResult<i64> {
+    enqueue_inner(
+        app,
+        url,
+        file_name,
+        headers,
+        platform,
+        cleanup_id,
+        false,
+        mirrors,
+        fetch_ctx,
+        true,
+    )
+    .await
+}
+
+async fn enqueue_inner(
+    app: &AppHandle,
+    url: &str,
+    file_name: &str,
+    headers: &[(String, String)],
+    platform: &str,
+    cleanup_id: &str,
+    start_paused: bool,
+    mirrors: Vec<String>,
+    fetch_ctx: &str,
+    play_mode: bool,
 ) -> AppResult<i64> {
     let state = app.state::<AppState>();
     // 入库前净化：删除原语（delete_local 拼路径）与重启恢复共用 DB 值，必须与 aria2 out 一致
@@ -173,7 +249,10 @@ pub async fn enqueue(
         )?
     };
 
-    if let Err(error) = add_to_aria2(app, id, url, &file_name, headers, platform, cleanup_id, start_paused, mirrors).await {
+    if let Err(error) =
+        add_to_aria2(app, id, url, &file_name, headers, platform, cleanup_id, start_paused, mirrors, play_mode)
+            .await
+    {
         mark_enqueue_failed(app, id, &error.to_string()).await;
         cleanup_transfer(&state, platform, cleanup_id).await;
         return Err(error);
@@ -339,7 +418,8 @@ pub async fn resume(app: &AppHandle, id: i64) -> AppResult<()> {
         headers = refreshed.1;
         // 重新入队 aria2（用于从失败态恢复或 unpause 失败时重入队，支持断点续传）
         let mirrors: Vec<String> = serde_json::from_str(&mirrors_json).unwrap_or_default();
-        let new_gid = add_to_aria2(app, id, &url, &file_name, &headers, &platform, &cleanup_id, false, mirrors).await?;
+        let new_gid =
+            add_to_aria2(app, id, &url, &file_name, &headers, &platform, &cleanup_id, false, mirrors, false).await?;
         tell_gid = new_gid;
     }
 
@@ -1049,11 +1129,11 @@ pub async fn apply_settings(app: &AppHandle, settings: &Settings) -> AppResult<(
     let mut options = json!({
         "max-overall-download-limit": limit_str(settings.download_speed_limit),
         "max-concurrent-downloads": settings.max_concurrent_downloads.max(1),
+        "enable-http-pipelining": if settings.http2_enabled { "true" } else { "false" },
     });
     options["all-proxy"] = json!(if proxy_configured(settings) { build_proxy_arg(settings) } else { String::new() });
     if let Err(error) = rpc_call("aria2.changeGlobalOption", vec![options]).await {
         engine_log(app, "apply_settings: changeGlobalOption 失败（代理/限速可能需要重启引擎后生效）");
-        // 不再包含「设置已保存」上下文：该错误作为 engineSyncError 由前端以非阻塞提示展示
         return Err(AppError::Api(format!("限速 / 并发 / 代理同步失败，重启引擎后生效：{error}")));
     }
     Ok(())
@@ -1081,9 +1161,11 @@ mod tests {
     }
 
     #[test]
-    fn quark_transfer_uses_conservative_single_server_connections() {
+    fn quark_transfer_uses_full_settings_concurrency() {
         let tuning = transfer_tuning("quark", 32, 16, 1);
-        assert_eq!(tuning, (4, 4));
+        assert_eq!(tuning, (32, 16));
+        let xunlei = transfer_tuning("xunlei", 32, 16, 1);
+        assert_eq!(xunlei, (8, 8));
     }
 
     #[test]

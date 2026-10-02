@@ -17,6 +17,8 @@ pub struct Settings {
     pub download_min_split_mb: i32,
     /// 单服务器最大连接数（aria2 max-connection-per-server），默认 16，上限 16
     pub download_conn_per_server: i32,
+    /// 启用 HTTP/2 意图开关（对齐 YunX-Desktop；aria2 实际映射为 HTTP 流水线）
+    pub http2_enabled: bool,
     /// PanSou 自部署搜索服务地址（如 http://192.168.1.100:8888）；空 = 未配置
     pub pansou_base_url: String,
     /// 百度网盘加速通道（百度分享高速下载）：开关
@@ -92,6 +94,7 @@ impl Default for Settings {
             download_retry_count: 3,
             download_min_split_mb: 4,
             download_conn_per_server: 16,
+            http2_enabled: false,
             pansou_base_url: String::new(),
             baidu_speed_enabled: false,
             baidu_speed_base_url: String::new(),

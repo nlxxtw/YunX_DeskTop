@@ -119,7 +119,7 @@ fn collect_cookie(window: &tauri::WebviewWindow, platform: Platform, urls: &[&st
 
 /// 验证 Cookie 并保存账号（返回昵称；失败 None）
 /// 注意：先做异步验证，后短锁写库（MutexGuard 不得跨 await）
-async fn validate_and_save(state: &AppState, platform: Platform, cookie: &str) -> Option<String> {
+pub async fn validate_and_save(state: &AppState, platform: Platform, cookie: &str) -> Option<String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

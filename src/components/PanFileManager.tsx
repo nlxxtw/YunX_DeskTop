@@ -102,7 +102,7 @@ export default function PanFileManager({
     if (playingFid || !isVideoFile(file.fname)) return;
     setPlayingFid(file.fid);
     try {
-      toast.success("高速下载缓冲中，稍后自动打开播放器…");
+      toast.success("高速下载缓冲中（顺序写盘），稍后自动用 VLC 打开本地文件…");
       const result = await ipc.playPersonalFile(platform, file);
       toast.success(`已开播（${result.player}），后台继续下载`);
     } catch (e) {

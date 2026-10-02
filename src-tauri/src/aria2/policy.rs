@@ -62,10 +62,11 @@ pub(crate) fn parse_status(v: &Value) -> TaskStatus {
     }
 }
 
-/// 夸克直链对 Range 并发和单主机连接数更敏感，采用保守参数避免 active 但 0 速度。
+/// 分片并发：对齐 YunX-Desktop（Kotlin）默认 32；有多镜像时再抬高。
+/// 迅雷固定更保守（上游固定 8）。夸克不再压到 4。
 pub(crate) fn transfer_tuning(platform: &str, threads: i32, connections: i32, mirror_count: usize) -> (i32, i32) {
-    if platform == "quark" {
-        return (threads.clamp(1, 4), connections.clamp(1, 4));
+    if platform == "xunlei" {
+        return (threads.clamp(1, 8), connections.clamp(1, 8));
     }
     let split = if mirror_count > 1 {
         (threads.clamp(16, 64) * (mirror_count as i32).min(2)).clamp(16, 64)
@@ -73,6 +74,15 @@ pub(crate) fn transfer_tuning(platform: &str, threads: i32, connections: i32, mi
         threads.clamp(1, 64)
     };
     (split, connections.clamp(1, 16))
+}
+
+/// 边下边播：按字节顺序灌盘，避免乱序分片导致 VLC 打不开未完成文件。
+pub(crate) fn play_stream_options() -> Vec<(String, String)> {
+    vec![
+        ("stream-piece-selector".into(), "inorder".into()),
+        ("enable-http-pipelining".into(), "true".into()),
+        ("min-split-size".into(), "1M".into()),
+    ]
 }
 
 /// 夸克直链僵死守护：速度 ≤1KB/s 时由 aria2 中止任务，避免 0 速度永久占住并发槽。

@@ -1,9 +1,10 @@
-//! 原画播放：aria2 高速下载 → 本地已缓冲部分可播（下到哪播到哪）。
+//! 原画播放：aria2 高速下载（顺序灌盘）→ 本地文件缓冲够了开播放器（下到哪播到哪）。
 
+use std::io::Read;
 use std::time::Duration;
 
 use serde_json::json;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::aria2::{self, parse_status, rpc_call, sanitize_out_path};
 use crate::error::{AppError, AppResult};
@@ -15,7 +16,7 @@ use crate::state::AppState;
 
 const WARMUP_MIN: i64 = 8 * 1024 * 1024;
 const WARMUP_MAX: i64 = 32 * 1024 * 1024;
-const WAIT_SECS: u64 = 180;
+const WAIT_SECS: u64 = 300;
 
 fn warmup_bytes(total: i64) -> i64 {
     if total <= 0 {
@@ -106,14 +107,13 @@ async fn play_via_aria2(app: &AppHandle, link: DownloadLink) -> AppResult<PlayRe
         });
     }
 
-    let task_id = aria2::enqueue(
+    let task_id = aria2::enqueue_for_play(
         app,
         &link.url,
         &file_name,
         &link.headers,
         &link.platform,
         &link.cleanup_id,
-        false,
         link.mirrors.clone(),
         &link.fetch_ctx,
     )
@@ -125,14 +125,26 @@ async fn play_via_aria2(app: &AppHandle, link: DownloadLink) -> AppResult<PlayRe
         "play",
         "buffer",
         &format!(
-            "任务 #{task_id} 高速下载中，约缓冲 {}MB 后开播（下到哪播到哪）",
+            "任务 #{task_id} 顺序高速下载中，约缓冲 {}MB 后开播",
             need / (1024 * 1024)
         ),
         &file_name,
     );
+    let _ = app.emit(
+        "play:buffer",
+        json!({
+            "taskId": task_id,
+            "needMb": need / (1024 * 1024),
+            "fileName": file_name,
+        }),
+    );
 
     let (path, downloaded, total) =
         wait_until_playable(app, task_id, link.size, &file_name, need).await?;
+
+    // 确认本地文件可读且有片头，再交给播放器（避免空路径 / 乱序空洞）
+    ensure_playable_file(&path, need)?;
+
     let pct = if total > 0 {
         (downloaded * 100 / total).clamp(0, 100)
     } else {
@@ -144,7 +156,7 @@ async fn play_via_aria2(app: &AppHandle, link: DownloadLink) -> AppResult<PlayRe
         logger::SUCCESS,
         "play",
         "open",
-        &format!("已缓冲 {pct}%，打开播放器；后台继续下载"),
+        &format!("已缓冲 {pct}%，用 {player} 打开本地文件；后台继续下载"),
         &path,
     );
 
@@ -173,6 +185,34 @@ fn find_completed_local(state: &AppState, file_name: &str) -> Option<String> {
     }
 }
 
+/// 确认磁盘上已有足够连续前缀，且路径给播放器用得上。
+fn ensure_playable_file(path: &str, need: i64) -> AppResult<()> {
+    let p = std::path::Path::new(path);
+    if !p.is_file() {
+        return Err(AppError::Api(format!(
+            "本地缓冲文件不存在，无法交给播放器：{path}"
+        )));
+    }
+    let meta = std::fs::metadata(p).map_err(|e| AppError::Api(format!("无法读取缓冲文件：{e}")))?;
+    let min_ok = WARMUP_MIN.min(need).max(1024 * 1024);
+    if meta.len() < min_ok as u64 {
+        return Err(AppError::Api(format!(
+            "缓冲不足（仅 {}MB），请稍后再点播放或到下载页查看进度",
+            meta.len() / (1024 * 1024)
+        )));
+    }
+    // 读片头几个字节：全 0 说明多半是稀疏/未真正落盘
+    let mut f = std::fs::File::open(p).map_err(|e| AppError::Api(format!("无法打开缓冲文件：{e}")))?;
+    let mut head = [0u8; 64];
+    let n = f.read(&mut head).unwrap_or(0);
+    if n < 12 || head.iter().all(|b| *b == 0) {
+        return Err(AppError::Api(
+            "缓冲文件片头无效（可能仍在乱序分片）。请等下载更多后再播，或重新点播放".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn wait_until_playable(
     app: &AppHandle,
     task_id: i64,
@@ -183,11 +223,12 @@ async fn wait_until_playable(
     let state = app.state::<AppState>();
     let deadline = std::time::Instant::now() + Duration::from_secs(WAIT_SECS);
     let mut last_log = std::time::Instant::now() - Duration::from_secs(5);
+    let mut last_emit = std::time::Instant::now() - Duration::from_secs(2);
 
     loop {
         if std::time::Instant::now() > deadline {
             return Err(AppError::Api(format!(
-                "缓冲超时（{WAIT_SECS}s），请到「下载」页查看任务 #{task_id}"
+                "缓冲超时（{WAIT_SECS}s），请到「下载」页查看任务 #{task_id}；速度够快后再点播放"
             )));
         }
 
@@ -221,7 +262,7 @@ async fn wait_until_playable(
                 "aria2.tellStatus",
                 vec![
                     json!(gid),
-                    json!(["status", "totalLength", "completedLength", "files"]),
+                    json!(["status", "totalLength", "completedLength", "files", "downloadSpeed"]),
                 ],
             )
             .await
@@ -281,7 +322,21 @@ async fn wait_until_playable(
                 &format!("task=#{task_id}"),
             );
         }
+        if last_emit.elapsed() >= Duration::from_secs(1) {
+            last_emit = std::time::Instant::now();
+            let _ = app.emit(
+                "play:buffer",
+                json!({
+                    "taskId": task_id,
+                    "haveMb": have as f64 / 1048576.0,
+                    "needMb": need as f64 / 1048576.0,
+                    "totalMb": total.max(1) as f64 / 1048576.0,
+                    "fileName": file_name,
+                }),
+            );
+        }
 
+        // 必须磁盘上真有足够字节，才认定可播（completedLength 有时超前于可读前缀）
         if ready && file_len >= WARMUP_MIN.min(need).max(1) {
             return Ok((path, have, total.max(have)));
         }

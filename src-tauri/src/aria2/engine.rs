@@ -256,6 +256,10 @@ pub(crate) async fn spawn_sidecar(app: &AppHandle) -> bool {
                 format!("--max-tries={}", settings.download_retry_count.clamp(0, 10)),
                 "--retry-wait=3".to_string(),
                 format!("--max-overall-download-limit={}", limit_str(settings.download_speed_limit)),
+                format!(
+                    "--enable-http-pipelining={}",
+                    if settings.http2_enabled { "true" } else { "false" }
+                ),
                 "--console-log-level=warn".to_string(),
                 "--enable-dht=true".to_string(),
                 "--enable-dht6=true".to_string(),
@@ -468,7 +472,9 @@ pub(crate) async fn resume_pending_tasks(app: &AppHandle) {
             let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
             let _ = conn.execute("UPDATE download_task SET gid = '' WHERE id = ?1", rusqlite::params![id]);
         }
-        if let Err(e) = add_to_aria2(app, id, &url, &file_name, &headers, &platform, &cleanup_id, was_paused, mirrors).await {
+        if let Err(e) =
+            add_to_aria2(app, id, &url, &file_name, &headers, &platform, &cleanup_id, was_paused, mirrors, false).await
+        {
             eprintln!("[yunx] 恢复任务 {id} 失败: {e}");
             let _ = update_status(app, id, DownloadTaskView::STATUS_FAILED, &e.to_string()).await;
         }

@@ -95,6 +95,33 @@ pub async fn web_login_cancel(app: AppHandle, platform: String) -> AppResult<()>
     login::web_login_cancel(&app, platform)
 }
 
+/// 手动粘贴 Cookie 登录（夸克 / UC / 百度 / 139）
+#[tauri::command]
+pub async fn import_cookie_login(app: AppHandle, platform: String, cookie: String) -> AppResult<String> {
+    let platform = Platform::from_key(&platform).ok_or_else(|| AppError::Api("未知平台".into()))?;
+    match platform {
+        Platform::Quark | Platform::Uc | Platform::Baidu | Platform::C139 => {}
+        _ => return Err(AppError::Api("该平台不支持粘贴 Cookie 登录".into())),
+    }
+    let cookie = cookie.trim().to_string();
+    if cookie.is_empty() {
+        return Err(AppError::Api("Cookie 不能为空".into()));
+    }
+    let state = app.state::<AppState>();
+    let nickname = login::validate_and_save(&state, platform, &cookie)
+        .await
+        .ok_or_else(|| {
+            let hint = match platform {
+                Platform::Quark | Platform::Uc => "需包含 __pus= 与 __puus=",
+                Platform::Baidu => "需包含 BDUSS=",
+                Platform::C139 => "需包含 Os_SSo_Sid+RMKEY 或 authorization=",
+                _ => "Cookie 无效",
+            };
+            AppError::Api(format!("Cookie 无效：{hint}"))
+        })?;
+    Ok(nickname)
+}
+
 /// 迅雷账号密码登录（可能触发短信验证步骤）
 #[tauri::command]
 pub async fn xunlei_login(app: AppHandle, username: String, password: String) -> AppResult<crate::api::xunlei::LoginStep> {

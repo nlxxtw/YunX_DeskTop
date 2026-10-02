@@ -370,22 +370,42 @@ pub async fn register_play(
     })
 }
 
-/// 查找本机播放器并打开本地代理 URL
+/// 查找本机播放器并打开本地文件路径（或 http 播放地址）。
+/// 优先 VLC / PotPlayer；找不到则明确报错，避免 `cmd start` 把路径交给错误程序。
 pub fn launch_player(play_url: &str) -> AppResult<String> {
-    let candidates = [
+    let mut candidates: Vec<String> = [
         r"G:\VLC\vlc.exe",
         r"C:\Program Files\VideoLAN\VLC\vlc.exe",
         r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
         r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
         r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini.exe",
         r"C:\Program Files (x86)\DAUM\PotPlayer\PotPlayerMini.exe",
-    ];
-    for path in candidates {
-        if std::path::Path::new(path).is_file() {
-            Command::new(path)
-                .arg(play_url)
-                .spawn()
-                .map_err(|e| AppError::Api(format!("启动播放器失败: {e}")))?;
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    for bin in ["vlc.exe", "vlc", "PotPlayerMini64.exe", "PotPlayerMini.exe"] {
+        if let Some(p) = which_on_path(bin) {
+            candidates.push(p);
+        }
+    }
+
+    let is_http = play_url.starts_with("http://") || play_url.starts_with("https://");
+    if !is_http {
+        let p = std::path::Path::new(play_url);
+        if !p.is_file() {
+            return Err(AppError::Api(format!(
+                "播放源不是有效本地文件：{play_url}"
+            )));
+        }
+    }
+
+    for path in &candidates {
+        if !std::path::Path::new(path).is_file() {
+            continue;
+        }
+        if Command::new(path).arg(play_url).spawn().is_ok() {
             let name = std::path::Path::new(path)
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -393,12 +413,22 @@ pub fn launch_player(play_url: &str) -> AppResult<String> {
             return Ok(name.to_string());
         }
     }
-    // 回退：系统默认关联打开 http URL（可能是浏览器）
-    Command::new("cmd")
-        .args(["/C", "start", "", play_url])
-        .spawn()
-        .map_err(|e| AppError::Api(format!("无法打开播放地址: {e}")))?;
-    Ok("default".into())
+
+    Err(AppError::Api(format!(
+        "未找到可用播放器（已试 VLC / PotPlayer）。请安装 VLC 后重试。播放源：{play_url}"
+    )))
+}
+
+fn which_on_path(bin: &str) -> Option<String> {
+    let output = Command::new("where").arg(bin).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && std::path::Path::new(l).is_file())
+        .map(str::to_string)
 }
 
 /// 视频扩展名判定（前端/命令共用逻辑）
