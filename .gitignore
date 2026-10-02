@@ -1,0 +1,68 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.zcode/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Rust / Tauri build artifacts（不提交脚手架生成物与编译产物）
+/src-tauri/target/
+/src-tauri/gen/
+/src-tauri/icons/ios/
+/src-tauri/icons/android/
+*.pdb
+
+# 项目内部文档（AI 协作流程文档，不上传）
+/docs/
+
+# 本地打包/调试日志
+build-log.txt
+portable/
+*.msi
+*_setup.exe
+_bench_*.py
+_test_*.py
+_test_baidupcs_config/
+src-tauri/_cargo_check_out.txt
+一键运行.bat
+
+# 测试 / 临时产物（不上传）
+/src-tauri/src/live_tests.rs
+/aria2-test-err.txt
+/aria2-test-out.txt
+/err2.txt
+/out2.txt
+
+# 环境变量 / 密钥
+.env
+.env.*
+!.env.example
+
+# TS / 工具链缓存
+*.tsbuildinfo
+.pnpm-store
+
+# Windows 系统文件
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/

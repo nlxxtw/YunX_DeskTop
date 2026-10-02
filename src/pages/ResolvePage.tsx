@@ -1,0 +1,1036 @@
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  ArrowDownToLine,
+  ArrowLeft,
+  Bookmark,
+  BookmarkPlus,
+  ChevronRight,
+  FileText,
+  FolderOpen,
+  FolderTree,
+  History,
+  Layers,
+  Link2,
+  Loader2,
+  Play,
+  Sparkles,
+  Trash2,
+} from "lucide-react";
+import PageHeader from "../components/PageHeader";
+import CrossDriveSearchModal from "../components/CrossDriveSearchModal";
+import BatchQueuePanel from "../components/BatchQueuePanel";
+import { errMsg, ipc, type Bookmark as BookmarkRow, type ResolveHistory, type ResolveSessionInfo, type ShareFile } from "../lib/ipc";
+import { toast } from "../lib/toast";
+import Modal from "../components/ui/Modal";
+import ConfirmDialog from "../components/ui/ConfirmDialog";
+import { formatBytes, platformLabel } from "../lib/format";
+import type { TabId } from "../lib/tabs";
+import resolveHero from "../assets/art/resolve-hero.jpg";
+
+function isVideoFile(name: string): boolean {
+  return /\.(mp4|mkv|mov|m4v|avi|ts|flv|webm|wmv|m2ts|mpeg|mpg)$/i.test(name);
+}
+
+interface ResolvePageProps {
+  onNavigate: (tab: TabId) => void;
+  /** 搜索页转入的待解析链接（消费后由 onPendingConsumed 清空） */
+  pending?: { link: string; pwd: string } | null;
+  onPendingConsumed?: () => void;
+}
+
+interface DirStackEntry {
+  fid: string;
+  name: string;
+}
+
+/** 目录树节点（懒加载：children 未定义=尚未展开；expanded 控制展开态） */
+interface TreeNode {
+  fid: string;
+  name: string;
+  isdir: boolean;
+  fsize: number;
+  expanded: boolean;
+  loading: boolean;
+  children?: TreeNode[];
+  hasMore?: boolean;
+  path: DirStackEntry[];
+  file?: ShareFile;
+}
+
+/** ShareFile → 树节点 */
+function toTreeNode(f: ShareFile, parentPath: DirStackEntry[]): TreeNode {
+  return {
+    fid: f.fid,
+    name: f.fname,
+    isdir: f.isdir,
+    fsize: f.fsize,
+    expanded: false,
+    loading: false,
+    children: undefined,
+    path: [...parentPath, { fid: f.fid, name: f.fname }],
+    file: f,
+  };
+}
+
+/** 按 fid 不可变更新树（命中节点应用 patch，其余原样传递） */
+function updateTree(nodes: TreeNode[], fid: string, patch: Partial<TreeNode>): TreeNode[] {
+  return nodes.map((n) => {
+    if (n.fid === fid) return { ...n, ...patch };
+    if (n.children) return { ...n, children: updateTree(n.children, fid, patch) };
+    return n;
+  });
+}
+
+function updateTreeRoot(root: TreeNode, fid: string, patch: Partial<TreeNode>): TreeNode {
+  if (root.fid === fid) return { ...root, ...patch };
+  return { ...root, children: updateTree(root.children ?? [], fid, patch) };
+}
+
+/** 解析页：粘贴链接 → 建会话 → 文件树导航 → 取链入队下载 + 收藏 */
+export default function ResolvePage({ onNavigate, pending, onPendingConsumed }: ResolvePageProps) {
+  const [input, setInput] = useState("");
+  const [pwd, setPwd] = useState("");
+  const [session, setSession] = useState<ResolveSessionInfo | null>(null);
+  const [dirStack, setDirStack] = useState<DirStackEntry[]>([]);
+  const [files, setFiles] = useState<ShareFile[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [page, setPage] = useState(1);
+  const [resolving, setResolving] = useState(false);
+  const [loadingDir, setLoadingDir] = useState(false);
+  const [downloadingFid, setDownloadingFid] = useState<Set<string>>(new Set());
+  const [playingFid, setPlayingFid] = useState<Set<string>>(new Set());
+  // B3.1 多选批量下载：勾选当前目录文件 → 底部操作条一键取链入队（batchBusy 独立守卫）
+  const [selectedFids, setSelectedFids] = useState<Set<string>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [folderBusy, setFolderBusy] = useState<string | null>(null);
+  /** 文件夹收集进度（收集 + 逐个取链入队） */
+  const [folderProgress, setFolderProgress] = useState<{ name: string; done: number; total: number } | null>(null);
+  const [showBookmarks, setShowBookmarks] = useState(false);
+  const [bookmarks, setBookmarks] = useState<BookmarkRow[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [history, setHistory] = useState<ResolveHistory[]>([]);
+  /** 目录树：是否展示侧栏树 + 根节点 */
+  const [showTree, setShowTree] = useState(false);
+  const [treeRoot, setTreeRoot] = useState<TreeNode | null>(null);
+  const [searchModalFilename, setSearchModalFilename] = useState<string | null>(null);
+  /** 破坏性操作确认（B3.2）：kind 区分目标，id 为删除对象 */
+  const [confirmAsk, setConfirmAsk] = useState<{ kind: "bookmark" | "history-item" | "history-clear"; id?: number } | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  /** 批量链接队列面板 */
+  const [showBatch, setShowBatch] = useState(false);
+  /** 解析进行中收到的新请求（后发优先：当前解析结束后自动开始，避免静默丢弃） */
+  const queuedResolve = useRef<{ link: string; pwd: string } | null>(null);
+  /** 解析在飞标志（ref 而非 state：队列续接时闭包内读到的一定是最新值） */
+  const resolvingRef = useRef(false);
+
+  /** 即时反馈迁移为全局 toast：读取类提示用 info，其余成功语义 */
+  const showNotice = (msg: string) => {
+    if (msg.startsWith("正在读取")) toast.info(msg);
+    else toast.success(msg);
+  };
+
+  async function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setIsDragging(false);
+    // 1. 检查是否有本地文件拖拽进来（如 .torrent 文件）
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const file = e.dataTransfer.files[0];
+      if (file.name.toLowerCase().endsWith(".torrent")) {
+        try {
+          showNotice(`正在读取 BT 种子「${file.name}」…`);
+          const buf = await file.arrayBuffer();
+          const bytes = Array.from(new Uint8Array(buf));
+          await ipc.enqueueTorrent(bytes, file.name);
+          showNotice(`BT 种子已加入下载：${file.name}`);
+          onNavigate("download");
+          return;
+        } catch (err) {
+          toast.error(errMsg(err));
+          return;
+        }
+      }
+    }
+    // 2. 检查文本拖拽（链接或磁力）
+    const text = e.dataTransfer.getData("text/plain");
+    if (text && text.trim()) {
+      setInput(text.trim());
+      resolve(text.trim());
+    }
+  }
+
+  // 解析（text 缺省取输入框内容；搜索页转入时传「链接 + 提取码」组合文本）。
+  // 解析进行中收到新请求时暂存队列（仅保留最新一条），当前解析结束后自动续接。
+  async function resolve(text?: string, pwdOverride?: string) {
+    const t = (text ?? input).trim();
+    if (!t) return;
+    if (resolvingRef.current) {
+      queuedResolve.current = { link: t, pwd: (pwdOverride ?? pwd).trim() };
+      return;
+    }
+    resolvingRef.current = true;
+    setResolving(true);
+    try {
+      const info = await ipc.resolveShare(t, (pwdOverride ?? pwd).trim() || undefined);
+      setSession(info);
+      setFiles(info.files);
+      setSelectedFids(new Set());
+      setHasMore(info.hasMore);
+      setDirStack([{ fid: "0", name: info.title || "根目录" }]);
+      // 初始化目录树根节点（懒加载子目录）
+      setTreeRoot({
+        fid: "0",
+        name: info.title || "根目录",
+        isdir: true,
+        fsize: 0,
+        expanded: true,
+        loading: false,
+        path: [{ fid: "0", name: info.title || "根目录" }],
+        hasMore: info.hasMore,
+        children: info.files.map((file) => toTreeNode(file, [{ fid: "0", name: info.title || "根目录" }])),
+      });
+      setPage(1);
+      if (info.title) showNotice(`已解析：${info.title}`);
+      ipc.listResolveHistory().then(setHistory).catch(() => {});
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      resolvingRef.current = false;
+      setResolving(false);
+      // 续接暂存的解析请求（搜索页 / 剪贴板 / 搜同款在解析中转入的场景）
+      const next = queuedResolve.current;
+      if (next) {
+        queuedResolve.current = null;
+        setInput(next.link);
+        setPwd(next.pwd);
+        void resolve(next.link, next.pwd);
+      }
+    }
+  }
+
+  // 搜索页转入：填入链接 + 提取码并立即解析
+  useEffect(() => {
+    if (!pending) return;
+    const link = pending.link.trim();
+    if (!link) return;
+    setInput(link);
+    setPwd(pending.pwd);
+    onPendingConsumed?.();
+    void resolve(link, pending.pwd);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending]);
+
+  // 目录导航
+  async function openDir(entry: ShareFile) {
+    if (!session || loadingDir) return;
+    setLoadingDir(true);
+    try {
+      const result = await ipc.listShareFiles(session.sessionKey, entry.fid, 1);
+      setFiles(result.files);
+      setSelectedFids(new Set());
+      setHasMore(result.hasMore);
+      setDirStack((s) => [...s, { fid: entry.fid, name: entry.fname }]);
+      setPage(1);
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setLoadingDir(false);
+    }
+  }
+
+  // 返回上级
+  async function backTo(index: number) {
+    if (!session || dirStack.length <= index + 1 || loadingDir) return;
+    const target = dirStack[index];
+    setLoadingDir(true);
+    try {
+      const result = await ipc.listShareFiles(session.sessionKey, target.fid, 1);
+      setFiles(result.files);
+      setSelectedFids(new Set());
+      setHasMore(result.hasMore);
+      setDirStack((s) => s.slice(0, index + 1));
+      setPage(1);
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setLoadingDir(false);
+    }
+  }
+
+  // 加载更多
+  async function loadMore() {
+    if (!session || loadingDir || !hasMore) return;
+    setLoadingDir(true);
+    try {
+      const next = page + 1;
+      const result = await ipc.listShareFiles(
+        session.sessionKey,
+        dirStack[dirStack.length - 1].fid,
+        next,
+      );
+      setFiles((f) => [...f, ...result.files]);
+      setHasMore(result.hasMore);
+      setPage(next);
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setLoadingDir(false);
+    }
+  }
+
+  async function loadTreeChildren(node: TreeNode): Promise<{ files: ShareFile[]; hasMore: boolean } | null> {
+    if (!session || node.loading) return null;
+    setTreeRoot((r) =>
+      r ? updateTreeRoot(r, node.fid, { loading: true }) : r
+    );
+    try {
+      const res = await ipc.listShareFiles(session.sessionKey, node.fid, 1);
+      setTreeRoot((r) =>
+        r
+          ? updateTreeRoot(r, node.fid, {
+              expanded: true,
+              loading: false,
+              hasMore: res.hasMore,
+              children: res.files.map((file) => toTreeNode(file, node.path)),
+            })
+          : r
+      );
+      return res;
+    } catch (e) {
+      toast.error(errMsg(e));
+      setTreeRoot((r) => (r ? updateTreeRoot(r, node.fid, { loading: false }) : r));
+      return null;
+    }
+  }
+
+  async function toggleTree(node: TreeNode) {
+    if (!node.isdir) return;
+    if (node.children) {
+      setTreeRoot((root) => root ? updateTreeRoot(root, node.fid, { expanded: !node.expanded }) : root);
+      return;
+    }
+    await loadTreeChildren(node);
+  }
+
+  async function enterTree(node: TreeNode) {
+    if (!session || !node.isdir || loadingDir) return;
+    setLoadingDir(true);
+    try {
+      const result = node.children ? { files: node.children.flatMap((child) => child.file ? [child.file] : []), hasMore: node.hasMore ?? false } : await loadTreeChildren(node);
+      if (!result) return;
+      setFiles(result.files);
+      setSelectedFids(new Set());
+      setHasMore(result.hasMore);
+      setDirStack(node.path);
+      setPage(1);
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setLoadingDir(false);
+    }
+  }
+
+  // 递归渲染目录树节点
+  function renderTree(node: TreeNode, depth = 0): ReactNode {
+    const indent = depth * 14;
+    return (
+      <li key={node.fid} className="py-0.5">
+        <div
+          className="flex w-full items-center gap-1 rounded px-1.5 py-1 text-left transition-colors hover:bg-carrier-deep"
+          style={{ paddingLeft: 8 + indent }}
+        >
+          {node.isdir ? (
+            node.loading ? (
+              <Loader2 size={12} className="shrink-0 animate-spin text-clay" />
+            ) : (
+              <button onClick={() => void toggleTree(node)} aria-label={node.expanded ? "折叠目录" : "展开目录"} className="shrink-0 rounded p-0.5">
+                <ChevronRight size={12} className={`text-ink-soft transition-transform ${node.expanded ? "rotate-90" : ""}`} />
+              </button>
+            )
+          ) : (
+            <span className="w-3 shrink-0" />
+          )}
+          {node.isdir ? (
+            <FolderOpen size={14} className="shrink-0 text-clay" />
+          ) : (
+            <FileText size={14} className="shrink-0 text-ink-soft" />
+          )}
+          {node.isdir ? (
+            <button onClick={() => void enterTree(node)} className="min-w-0 flex-1 truncate text-left text-xs text-ink" title={`进入 ${node.name}`}>{node.name}</button>
+          ) : (
+            <span className="min-w-0 flex-1 truncate text-xs text-ink">{node.name}</span>
+          )}
+          {!node.isdir && (
+            <span className="shrink-0 font-mono text-[10px] text-ink-soft/70">{formatBytes(node.fsize)}</span>
+          )}
+        </div>
+        {node.expanded && node.children && <ul>{node.children.map((c) => renderTree(c, depth + 1))}</ul>}
+      </li>
+    );
+  }
+
+  // 单文件下载：取链 → 入队（放宽互斥：仅本行在飞时禁止重复点击，跨行可并行）
+  async function downloadFile(file: ShareFile) {
+    if (!session || downloadingFid.has(file.fid)) return;
+    setDownloadingFid((prev) => new Set(prev).add(file.fid));
+    try {
+      const link = await ipc.getDownloadLink(session.sessionKey, file);
+      await ipc.enqueueDownload(
+        link.url,
+        link.filename || file.fname,
+        link.headers,
+        link.platform,
+        link.cleanupId || undefined,
+        link.mirrors || undefined,
+        link.fetchCtx || undefined,
+      );
+      showNotice(`已加入下载：${link.filename || file.fname}`);
+      onNavigate("download");
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setDownloadingFid((prev) => {
+        const next = new Set(prev);
+        next.delete(file.fid);
+        return next;
+      });
+    }
+  }
+
+  // 原画边下边播：取链 → GeZi 本地代理 → VLC
+  async function playFile(file: ShareFile) {
+    if (!session || playingFid.has(file.fid) || !isVideoFile(file.fname)) return;
+    setPlayingFid((prev) => new Set(prev).add(file.fid));
+    try {
+      const result = await ipc.playShareFile(session.sessionKey, file);
+      showNotice(`原画播放中（${result.player}）`);
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setPlayingFid((prev) => {
+        const next = new Set(prev);
+        next.delete(file.fid);
+        return next;
+      });
+    }
+  }
+
+  // 文件夹下载：递归收集 → 逐个取链入队（带实时进度；切换栏目不中断）
+  async function downloadFolder(entry: ShareFile) {
+    if (!session || folderBusy) return;
+    setFolderBusy(entry.fid);
+    setFolderProgress(null);
+    try {
+      const collected = await ipc.collectFolderFiles(session.sessionKey, entry.fid);
+      if (collected.length === 0) {
+        showNotice("该文件夹为空");
+        return;
+      }
+      setFolderProgress({ name: entry.fname, done: 0, total: collected.length });
+      let done = 0;
+      let failed = 0;
+      for (const cf of collected) {
+        try {
+          const link = await ipc.getDownloadLink(session.sessionKey, cf);
+          // 携带相对目录，还原分享文件夹结构（aria2 out 支持子目录路径）
+          const base = link.filename || cf.fname;
+          const outName = cf.relDir ? `${cf.relDir}/${base}` : base;
+          await ipc.enqueueDownload(
+            link.url,
+            outName,
+            link.headers,
+            link.platform,
+            link.cleanupId || undefined,
+            link.mirrors || undefined,
+            link.fetchCtx || undefined,
+          );
+          done++;
+        } catch {
+          failed++;
+        }
+        setFolderProgress((p) => (p ? { ...p, done: done + failed } : p));
+      }
+      showNotice(`已入队 ${done} 个文件${failed > 0 ? `，${failed} 个失败（详见日志）` : ""}`);
+      if (done > 0) onNavigate("download");
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setFolderBusy(null);
+      setFolderProgress(null);
+    }
+  }
+
+  // 多选批量下载：逐个取链入队（串行取链防风控；batchBusy 独立于单行/文件夹守卫）
+  async function downloadSelected() {
+    if (!session || batchBusy || selectedFids.size === 0) return;
+    const targets = files.filter((f) => !f.isdir && selectedFids.has(f.fid));
+    if (targets.length === 0) return;
+    setBatchBusy(true);
+    try {
+      let done = 0;
+      let failed = 0;
+      for (const f of targets) {
+        try {
+          const link = await ipc.getDownloadLink(session.sessionKey, f);
+          await ipc.enqueueDownload(
+            link.url,
+            link.filename || f.fname,
+            link.headers,
+            link.platform,
+            link.cleanupId || undefined,
+            link.mirrors || undefined,
+            link.fetchCtx || undefined,
+          );
+          done++;
+        } catch {
+          failed++;
+        }
+      }
+      showNotice(`已入队 ${done} 个文件${failed > 0 ? `，${failed} 个失败（详见日志）` : ""}`);
+      if (done > 0) {
+        setSelectedFids(new Set());
+        onNavigate("download");
+      }
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
+  // 收藏当前链接
+  async function bookmarkCurrent() {
+    const link = input.trim();
+    if (!link) return;
+    try {
+      await ipc.addBookmark(link, session?.title ?? "", pwd);
+      showNotice("已收藏该链接");
+    } catch (e) {
+      toast.error(errMsg(e));
+    }
+  }
+
+  // 收藏列表
+  async function openBookmarks() {
+    try {
+      setBookmarks(await ipc.listBookmarks());
+      setShowBookmarks(true);
+    } catch (e) {
+      toast.error(errMsg(e));
+    }
+  }
+
+  async function removeBookmark(id: number) {
+    try {
+      await ipc.removeBookmark(id);
+      setBookmarks((b) => b.filter((x) => x.id !== id));
+    } catch (e) {
+      toast.error(errMsg(e));
+    }
+  }
+
+  // 解析历史
+  async function openHistory() {
+    try {
+      setHistory(await ipc.listResolveHistory());
+      setShowHistory(true);
+    } catch (e) {
+      toast.error(errMsg(e));
+    }
+  }
+
+  async function removeHistory(id: number) {
+    try {
+      await ipc.deleteResolveHistory(id);
+      setHistory((h) => h.filter((x) => x.id !== id));
+    } catch (e) {
+      toast.error(errMsg(e));
+    }
+  }
+
+  async function clearHistory() {
+    try {
+      await ipc.clearResolveHistory();
+      setHistory([]);
+    } catch (e) {
+      toast.error(errMsg(e));
+    }
+  }
+
+  // 输入变化自动匹配提取码（文本中「提取码: xxxx」）
+  useEffect(() => {
+    if (!input) return;
+    const m = input.match(/(?:提取码|访问码|密码)[：:]\s*([A-Za-z0-9]{4,8})/);
+    if (m && !pwd) setPwd(m[1]);
+  }, [input]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <div className="space-y-6">
+      <PageHeader tab="resolve" subtitle="粘贴网盘分享、Magnet 磁力或网络直链，自动识别平台并高速下载">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={bookmarkCurrent}
+            disabled={!input.trim()}
+            className="flex items-center gap-1.5 rounded-ctrl border border-ink/15 px-3.5 py-1.5 text-xs font-medium text-ink transition-colors hover:border-clay hover:text-clay-deep disabled:opacity-40"
+          >
+            <BookmarkPlus size={14} />
+            收藏此链接
+          </button>
+          <button
+            onClick={openBookmarks}
+            className="flex items-center gap-1.5 rounded-ctrl border border-ink/15 px-3.5 py-1.5 text-xs font-medium text-ink transition-colors hover:border-clay hover:text-clay-deep"
+          >
+            <Bookmark size={14} />
+            收藏夹
+          </button>
+          <button
+            onClick={openHistory}
+            className="flex items-center gap-1.5 rounded-ctrl border border-ink/15 px-3.5 py-1.5 text-xs font-medium text-ink transition-colors hover:border-clay hover:text-clay-deep"
+          >
+            <History size={14} />
+            解析记录
+          </button>
+          <button
+            onClick={() => setShowBatch(true)}
+            className="flex items-center gap-1.5 rounded-ctrl border border-ink/15 px-3.5 py-1.5 text-xs font-medium text-ink transition-colors hover:border-clay hover:text-clay-deep"
+            title="批量粘贴多条链接，串行解析并一键入队下载"
+          >
+            <Layers size={14} />
+            批量队列
+          </button>
+        </div>
+      </PageHeader>
+
+      {/* 输入区（支持拖拽 .torrent 种子与文本直链） */}
+      <section
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDragging(true);
+        }}
+        onDragLeave={() => setIsDragging(false)}
+        onDrop={handleDrop}
+        className="relative animate-rise rounded-card bg-carrier p-6"
+        style={{ animationDelay: "60ms" }}
+      >
+        {isDragging && (
+          <div className="absolute inset-0 z-20 flex flex-col items-center justify-center rounded-card border-2 border-dashed border-clay bg-carrier/95 backdrop-blur-sm animate-fade">
+            <ArrowDownToLine size={32} className="animate-bounce text-clay" />
+            <p className="mt-2 text-sm font-semibold text-ink">松开鼠标，立即解析或添加下载任务</p>
+            <p className="mt-1 text-xs text-ink-soft">支持 .torrent 种子文件、磁力链接或网络直链</p>
+          </div>
+        )}
+        <div className="flex gap-4">
+          {/* hero 插画（未解析时展示） */}
+          {!session && (
+            <img
+              src={resolveHero}
+              alt=""
+              draggable={false}
+              className="hidden h-44 w-44 shrink-0 rounded-card object-cover md:block"
+            />
+          )}
+          <div className="min-w-0 flex-1">
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.currentTarget.value)}
+              placeholder="粘贴网盘分享链接、Magnet 磁力链接（magnet:?xt=...）或网络直链，或直接拖拽 .torrent 种子文件进窗口"
+              className="h-24 w-full resize-none rounded-ctrl border border-ink/10 bg-carrier-deep px-4 py-3 text-sm text-ink placeholder:text-ink-soft/60 focus:border-clay focus:outline-none"
+            />
+            <div className="mt-3 flex items-center gap-3">
+              <input
+                value={pwd}
+                onChange={(e) => setPwd(e.currentTarget.value)}
+                placeholder="提取码（可自动识别）"
+                className="w-36 rounded-ctrl border border-ink/10 bg-carrier-deep px-3 py-1.5 text-xs text-ink placeholder:text-ink-soft/60 focus:border-clay focus:outline-none"
+              />
+              <button
+                onClick={() => resolve()}
+                disabled={!input.trim() || resolving}
+                className="flex items-center gap-2 rounded-ctrl bg-clay px-5 py-2 text-sm font-semibold text-on-accent transition-colors hover:bg-clay-deep disabled:opacity-50"
+              >
+                {resolving ? <Loader2 size={15} className="animate-spin" /> : <Link2 size={15} />}
+                {resolving ? "解析中…" : "解析"}
+              </button>
+              <span className="text-xs text-ink-soft/70">支持：6 大网盘分享 / Magnet 磁力 / BT 种子 / 网页直链</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* 提示条 */}
+      {folderProgress && (
+        <div className="rounded-ctrl bg-carrier px-4 py-2.5">
+          <div className="flex items-center justify-between text-sm">
+            <span className="min-w-0 truncate text-ink">
+              正在处理「{folderProgress.name}」…
+            </span>
+            <span className="ml-3 shrink-0 font-mono text-xs text-clay-deep">
+              {folderProgress.done}/{folderProgress.total}
+            </span>
+          </div>
+          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-carrier-deep">
+            <div
+              className="h-full w-full origin-left rounded-full bg-clay transition-transform duration-300"
+              style={{
+                transform: `scaleX(${folderProgress.total > 0 ? Math.min(1, folderProgress.done / folderProgress.total) : 0})`,
+              }}
+            />
+          </div>
+          <p className="mt-1.5 text-[11px] text-ink-soft/70">
+            可切换到「日志」页查看每一步详情；切换栏目不会中断收集
+          </p>
+        </div>
+      )}
+
+      {/* 解析结果：面包屑 + 文件列表 */}
+      {session && (
+        <section className="animate-rise rounded-card bg-carrier p-6" style={{ animationDelay: "120ms" }}>
+          <div className="flex gap-5">
+            {/* 目录树侧栏（懒加载） */}
+            {showTree && treeRoot && (
+              <aside className="w-64 shrink-0 rounded-ctrl border border-ink/10 bg-carrier-deep/40 p-2">
+                <p className="mb-1 px-2 font-mono text-[10px] tracking-[0.25em] text-ink-soft">
+                  DIRECTORY TREE
+                </p>
+                <ul className="max-h-[50vh] overflow-y-auto pr-0.5">{renderTree(treeRoot)}</ul>
+              </aside>
+            )}
+            <div className="min-w-0 flex-1">
+          {/* 面包屑 */}
+          <div className="flex flex-wrap items-center gap-1 border-b border-ink/10 pb-4">
+            <span className="rounded-full bg-clay px-2.5 py-0.5 font-mono text-[10px] font-semibold tracking-widest text-on-accent">
+              {platformLabel(session.platform)}
+            </span>
+            {dirStack.map((entry, i) => (
+              <span key={`${entry.fid}-${i}`} className="flex items-center gap-1">
+                {i > 0 && <ChevronRight size={13} className="text-ink-soft/50" />}
+                <button
+                  onClick={() => backTo(i)}
+                  className={`rounded px-1.5 py-0.5 text-xs transition-colors ${
+                    i === dirStack.length - 1
+                      ? "font-semibold text-ink"
+                      : "text-ink-soft hover:bg-carrier-deep hover:text-ink"
+                  }`}
+                >
+                  {entry.name}
+                </button>
+              </span>
+            ))}
+            {dirStack.length > 1 && (
+              <button
+                onClick={() => backTo(dirStack.length - 2)}
+                className="ml-2 flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-ink-soft hover:bg-carrier-deep hover:text-ink"
+              >
+                <ArrowLeft size={12} />
+                返回上级
+              </button>
+            )}
+            {loadingDir && <Loader2 size={14} className="animate-spin text-clay" />}
+            <button
+              onClick={() => setShowTree((v) => !v)}
+              className={`ml-auto flex shrink-0 items-center gap-1.5 rounded-ctrl border px-3 py-1.5 text-xs font-medium transition-colors ${
+                showTree
+                  ? "border-clay text-clay-deep"
+                  : "border-ink/15 text-ink-soft hover:border-clay hover:text-clay-deep"
+              }`}
+              title={showTree ? "隐藏目录树" : "显示目录树"}
+            >
+              <FolderTree size={13} />
+              目录树
+            </button>
+          </div>
+
+          {/* 文件列表 */}
+          {files.length === 0 ? (
+            <p className="py-10 text-center text-sm text-ink-soft">
+              {loadingDir ? "加载中…" : "此目录为空"}
+            </p>
+          ) : (
+            <ul className="divide-y divide-ink/10">
+              {files.map((file) => (
+                <li key={file.fid} className="flex items-center gap-3 py-3">
+                  {!file.isdir && (
+                    <input
+                      type="checkbox"
+                      checked={selectedFids.has(file.fid)}
+                      onChange={(e) =>
+                        setSelectedFids((prev) => {
+                          const next = new Set(prev);
+                          if (e.currentTarget.checked) next.add(file.fid);
+                          else next.delete(file.fid);
+                          return next;
+                        })
+                      }
+                      aria-label={`选择 ${file.fname}`}
+                      className="size-4 shrink-0 cursor-pointer accent-clay"
+                    />
+                  )}
+                  {file.isdir ? (
+                    <FolderOpen size={18} className="shrink-0 text-clay" />
+                  ) : (
+                    <FileText size={18} className="shrink-0 text-ink-soft" />
+                  )}
+                  <button
+                    onClick={() => file.isdir && openDir(file)}
+                    className="min-w-0 flex-1 truncate text-left text-sm text-ink hover:text-clay-deep"
+                    title={file.fname}
+                  >
+                    {file.fname}
+                  </button>
+                  <span className="shrink-0 font-mono text-xs text-ink-soft">
+                    {file.isdir ? "文件夹" : formatBytes(file.fsize)}
+                  </span>
+                  {!file.isdir && (
+                    <button
+                      onClick={() => setSearchModalFilename(file.fname)}
+                      className="flex shrink-0 items-center gap-1 rounded-ctrl border border-ink/15 px-2.5 py-1.5 text-xs text-ink-soft hover:border-clay hover:text-clay transition-colors"
+                      title="在夸克/UC/123等其他网盘搜同款不限速资源"
+                    >
+                      <Sparkles size={12} className="text-clay" />
+                      <span>搜同款</span>
+                    </button>
+                  )}
+                  {!file.isdir && isVideoFile(file.fname) && (
+                    <button
+                      onClick={() => void playFile(file)}
+                      disabled={
+                        folderBusy !== null ||
+                        batchBusy ||
+                        playingFid.has(file.fid) ||
+                        downloadingFid.has(file.fid)
+                      }
+                      className="flex shrink-0 items-center gap-1.5 rounded-ctrl border border-clay/40 bg-carrier px-3 py-1.5 text-xs font-semibold text-clay-deep transition-colors hover:border-clay hover:bg-clay/10 disabled:opacity-50"
+                      title="原画边下边播（本地代理 + VLC）"
+                    >
+                      {playingFid.has(file.fid) ? (
+                        <Loader2 size={13} className="animate-spin" />
+                      ) : (
+                        <Play size={13} />
+                      )}
+                      {playingFid.has(file.fid) ? "取链中…" : "播放"}
+                    </button>
+                  )}
+                  <button
+                    onClick={() => (file.isdir ? downloadFolder(file) : downloadFile(file))}
+                    disabled={
+                      folderBusy !== null ||
+                      batchBusy ||
+                      (file.isdir ? false : downloadingFid.has(file.fid))
+                    }
+                    className="flex shrink-0 items-center gap-1.5 rounded-ctrl bg-clay px-3 py-1.5 text-xs font-semibold text-on-accent transition-colors hover:bg-clay-deep disabled:opacity-50"
+                  >
+                    {file.isdir ? (
+                      folderBusy === file.fid ? <Loader2 size={13} className="animate-spin" /> : <ArrowDownToLine size={13} />
+                    ) : (
+                      downloadingFid.has(file.fid) ? <Loader2 size={13} className="animate-spin" /> : <ArrowDownToLine size={13} />
+                    )}
+                    {file.isdir
+                      ? folderBusy === file.fid
+                        ? "收集中…"
+                        : "下载全部"
+                      : downloadingFid.has(file.fid)
+                        ? "取链中…"
+                        : "下载"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {/* 多选批量操作条（B3.1） */}
+          {selectedFids.size > 0 && (
+            <div className="animate-rise mt-3 flex flex-wrap items-center gap-3 rounded-ctrl bg-clay/10 px-4 py-2.5">
+              <span className="text-sm font-medium text-ink">
+                已选 {selectedFids.size} 项
+                <span className="ml-2 font-mono text-xs text-ink-soft">
+                  {formatBytes(
+                    files.filter((f) => selectedFids.has(f.fid)).reduce((sum, f) => sum + f.fsize, 0),
+                  )}
+                </span>
+              </span>
+              <button
+                onClick={() => setSelectedFids(new Set(files.filter((f) => !f.isdir).map((f) => f.fid)))}
+                className="cursor-pointer rounded-ctrl border border-ink/15 px-3 py-1 text-xs text-ink-soft transition-colors hover:border-clay hover:text-clay-deep"
+              >
+                全选本页
+              </button>
+              <button
+                onClick={() => setSelectedFids(new Set())}
+                className="cursor-pointer rounded-ctrl border border-ink/15 px-3 py-1 text-xs text-ink-soft transition-colors hover:border-clay hover:text-clay-deep"
+              >
+                清除
+              </button>
+              <button
+                onClick={() => void downloadSelected()}
+                disabled={batchBusy || folderBusy !== null}
+                className="ml-auto flex cursor-pointer items-center gap-1.5 rounded-ctrl bg-clay px-4 py-1.5 text-xs font-semibold text-on-accent transition-colors hover:bg-clay-deep disabled:opacity-50"
+              >
+                {batchBusy ? <Loader2 size={13} className="animate-spin" /> : <ArrowDownToLine size={13} />}
+                {batchBusy ? "取链中…" : "下载选中"}
+              </button>
+            </div>
+          )}
+
+          {/* 加载更多 */}
+          {hasMore && files.length > 0 && (
+            <button
+              onClick={loadMore}
+              disabled={loadingDir}
+              className="mt-4 w-full rounded-ctrl border border-ink/10 py-2 text-xs font-medium text-ink-soft transition-colors hover:border-clay hover:text-clay-deep disabled:opacity-50"
+            >
+              {loadingDir ? "加载中…" : "加载更多"}
+            </button>
+          )}
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* 收藏夹浮层 */}
+      {showBookmarks && (
+        <Modal
+          open
+          onClose={() => setShowBookmarks(false)}
+          panelClassName="max-w-lg overflow-hidden"
+          bodyClassName="max-h-[52vh] overflow-y-auto px-6 py-2"
+          title={<h3 className="font-display text-lg font-semibold text-ink">收藏的分享链接</h3>}
+        >
+              {bookmarks.length === 0 ? (
+                <p className="py-10 text-center text-sm text-ink-soft">暂无收藏</p>
+              ) : (
+                <ul className="divide-y divide-ink/10">
+                  {bookmarks.map((b) => (
+                    <li key={b.id} className="flex items-center gap-3 py-3">
+                      <span className="shrink-0 rounded-full bg-carrier-deep px-2 py-0.5 font-mono text-[10px] text-ink-soft">
+                        {platformLabel(b.platform) || "未知"}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm text-ink">{b.title || b.link}</p>
+                        <p className="truncate font-mono text-[10px] text-ink-soft/70">{b.link}</p>
+                      </div>
+                      <button
+                        onClick={() => {
+                          setShowBookmarks(false);
+                          setInput(b.link);
+                          setPwd(b.pwd);
+                        }}
+                        className="shrink-0 rounded-ctrl bg-clay px-3 py-1 text-xs font-semibold text-on-accent hover:bg-clay-deep"
+                      >
+                        解析
+                      </button>
+                      <button
+                        onClick={() => setConfirmAsk({ kind: "bookmark", id: b.id })}
+                        className="shrink-0 rounded-ctrl p-1.5 text-ink-soft hover:bg-clay/10 hover:text-clay-deep"
+                        title="删除收藏"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+      </Modal>
+      )}
+
+      {/* 解析记录浮层 */}
+      {showHistory && (
+        <Modal
+          open
+          onClose={() => setShowHistory(false)}
+          panelClassName="max-w-lg overflow-hidden"
+          bodyClassName="max-h-[52vh] overflow-y-auto px-6 py-2"
+          title={
+            <div className="flex items-center gap-2">
+              <h3 className="font-display text-lg font-semibold text-ink">解析记录</h3>
+              {history.length > 0 && (
+                <button
+                  onClick={() => setConfirmAsk({ kind: "history-clear" })}
+                  className="cursor-pointer rounded-ctrl px-2.5 py-1 text-xs text-ink-soft transition-colors hover:bg-clay/10 hover:text-clay-deep"
+                >
+                  清空记录
+                </button>
+              )}
+            </div>
+          }
+        >
+              {history.length === 0 ? (
+                <p className="py-10 text-center text-sm text-ink-soft">暂无解析记录</p>
+              ) : (
+                <ul className="divide-y divide-ink/10">
+                  {history.map((h) => (
+                    <li key={h.id} className="flex items-center gap-3 py-3">
+                      <span className="shrink-0 rounded-full bg-carrier-deep px-2 py-0.5 font-mono text-[10px] text-ink-soft">
+                        {platformLabel(h.platform) || "未知"}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm text-ink">{h.title || "（无标题）"}</p>
+                        <p className="truncate font-mono text-[10px] text-ink-soft/70">{h.link}</p>
+                      </div>
+                      <span className="shrink-0 font-mono text-[10px] text-ink-soft/60">
+                        {new Date(h.createTime).toLocaleDateString()}
+                      </span>
+                      <button
+                        onClick={() => {
+                          setShowHistory(false);
+                          setInput(h.link);
+                          setPwd("");
+                        }}
+                        className="shrink-0 rounded-ctrl bg-clay px-3 py-1 text-xs font-semibold text-on-accent hover:bg-clay-deep"
+                      >
+                        再解析
+                      </button>
+                      <button
+                        onClick={() => setConfirmAsk({ kind: "history-item", id: h.id })}
+                        className="shrink-0 rounded-ctrl p-1.5 text-ink-soft hover:bg-clay/10 hover:text-clay-deep"
+                        title="删除记录"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+        </Modal>
+      )}
+
+      {/* 破坏性操作确认（删除收藏 / 删除记录 / 清空记录） */}
+      <ConfirmDialog
+        open={confirmAsk != null}
+        danger
+        title={confirmAsk?.kind === "bookmark" ? "删除这条收藏？" : confirmAsk?.kind === "history-clear" ? "清空全部解析记录？" : "删除这条解析记录？"}
+        description={
+          confirmAsk?.kind === "history-clear"
+            ? "将删除全部解析历史（含标题与链接），不可恢复。"
+            : "删除后不可恢复。"
+        }
+        confirmText={confirmAsk?.kind === "history-clear" ? "全部清空" : "删除"}
+        onConfirm={() => {
+          const ask = confirmAsk;
+          setConfirmAsk(null);
+          if (!ask) return;
+          if (ask.kind === "bookmark" && ask.id != null) void removeBookmark(ask.id);
+          else if (ask.kind === "history-item" && ask.id != null) void removeHistory(ask.id);
+          else if (ask.kind === "history-clear") void clearHistory();
+        }}
+        onCancel={() => setConfirmAsk(null)}
+      />
+
+      {/* 批量链接队列抽屉 */}
+      <BatchQueuePanel
+        open={showBatch}
+        onClose={() => setShowBatch(false)}
+        onGoDownload={() => onNavigate("download")}
+      />
+
+      {/* 跨网盘搜同款弹窗 */}
+      <CrossDriveSearchModal
+        open={Boolean(searchModalFilename)}
+        filename={searchModalFilename || ""}
+        onClose={() => setSearchModalFilename(null)}
+        onResolveShare={(url, p) => {
+          setSearchModalFilename(null);
+          setInput(url);
+          setPwd(p || "");
+          resolve(p ? `${url} 提取码：${p}` : url);
+        }}
+      />
+    </div>
+  );
+}

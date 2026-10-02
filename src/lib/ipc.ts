@@ -1,0 +1,512 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+// ---------- 类型（与 Rust models.rs 对齐） ----------
+
+export interface AppInfo {
+  appName: string;
+  version: string;
+  platform: string;
+}
+
+export interface Settings {
+  downloadDir: string;
+  maxConcurrentDownloads: number;
+  downloadThreads: number;
+  downloadSpeedLimit: number;
+  downloadRetryCount: number;
+  downloadMinSplitMb: number;
+  downloadConnPerServer: number;
+  pansouBaseUrl: string;
+  /** 百度网盘加速通道（百度分享高速下载）：开关 */
+  baiduSpeedEnabled: boolean;
+  /** 加速通道服务地址；空 = 默认服务 */
+  baiduSpeedBaseUrl: string;
+  /** 加速通道解析码（失效时自动更新） */
+  baiduSpeedPassword: string;
+  darkMode: number;
+  /** 配色主题 ID（七套之一；未知 ID 前端回退 warm-editorial） */
+  colorTheme: string;
+  autoCheckUpdate: boolean;
+  clipboardMonitor: boolean;
+  minimizeToTray: boolean;
+  downloadNotify: boolean;
+  autoLaunch: boolean;
+  showSearchTab: boolean;
+  /** 代理开关（aria2 全局限速走 --all-proxy） */
+  proxyEnabled: boolean;
+  proxyType: string;
+  proxyHost: string;
+  proxyPort: number;
+  proxyUsername: string;
+  proxyPassword: string;
+  /** 平台当前选中账号（platform → 账号 key） */
+  activeAccountKeys: Record<string, string>;
+  /** 首启引导已完成 */
+  onboarded: boolean;
+  /** 订阅追剧自动下载总开关（默认开；PanSou 未配置时实际不生效） */
+  subscriptionEnabled: boolean;
+  /** 订阅检查间隔（分钟，默认 360） */
+  subscriptionIntervalMinutes: number;
+  /** BT Tracker 列表自动更新（默认开） */
+  btTrackerAutoUpdate: boolean;
+  /** 下载完成后动作："none" | "shutdown" | "sleep" */
+  afterDownloadAction: string;
+}
+
+/** 设置默认值（与 Rust Settings::default 对齐；IPC 不可用时兜底） */
+export const DEFAULT_SETTINGS: Settings = {
+  downloadDir: "",
+  maxConcurrentDownloads: 1,
+  downloadThreads: 32,
+  downloadSpeedLimit: 0,
+  downloadRetryCount: 3,
+  downloadMinSplitMb: 4,
+  downloadConnPerServer: 16,
+  pansouBaseUrl: "",
+  baiduSpeedEnabled: false,
+  baiduSpeedBaseUrl: "",
+  baiduSpeedPassword: "",
+  darkMode: 0,
+  colorTheme: "warm-editorial",
+  autoCheckUpdate: true,
+  clipboardMonitor: false,
+  minimizeToTray: true,
+  downloadNotify: true,
+  autoLaunch: false,
+  showSearchTab: false,
+  proxyEnabled: false,
+  proxyType: "http",
+  proxyHost: "",
+  proxyPort: 0,
+  proxyUsername: "",
+  proxyPassword: "",
+  activeAccountKeys: {},
+  onboarded: false,
+  subscriptionEnabled: true,
+  subscriptionIntervalMinutes: 360,
+  btTrackerAutoUpdate: true,
+  afterDownloadAction: "none",
+};
+
+/** PanSou 搜索结果条目（与 Rust SearchItem 对齐） */
+export interface SearchItem {
+  type: string;
+  url: string;
+  password: string;
+  note: string;
+  source: string;
+}
+
+export interface AccountSummary {
+  platform: string;
+  nickname: string | null;
+  loggedIn: boolean;
+}
+
+/** 平台账号行（多账号切换列表；active = 当前选中） */
+export interface AccountRow {
+  platform: string;
+  key: string;
+  nickname: string;
+  updatedAt: number;
+  active: boolean;
+}
+
+/** 代理连通性测试结果（设置页「测试代理」展示） */
+export interface ProxyTestResult {
+  ok: boolean;
+  ip: string;
+  latencyMs: number;
+  error: string;
+}
+
+/** PanSou 连通性检测结果（首启引导 / 设置页） */
+export interface PansouPingResult {
+  ok: boolean;
+  latencyMs: number;
+  error: string;
+}
+
+export interface ParsedShare {
+  platform: string;
+  shareId: string;
+  pwd: string;
+}
+
+export interface ShareFile {
+  fid: string;
+  fname: string;
+  fsize: number;
+  isdir: boolean;
+  pdirFid: string;
+  fidToken: string;
+  modifyTime: string;
+}
+
+export interface ResolveSessionInfo {
+  sessionKey: string;
+  platform: string;
+  title: string;
+  files: ShareFile[];
+  hasMore: boolean;
+}
+
+export interface ShareFilePage {
+  files: ShareFile[];
+  hasMore: boolean;
+}
+
+/** 文件夹收集结果（携带相对目录，还原文件夹结构保存） */
+export interface CollectedFile {
+  fid: string;
+  fname: string;
+  fsize: number;
+  isdir: boolean;
+  pdirFid: string;
+  fidToken: string;
+  modifyTime: string;
+  /** 相对目录路径（含子目录名；根级文件为空） */
+  relDir: string;
+}
+
+export interface DownloadLink {
+  url: string;
+  filename: string;
+  size: number;
+  headers: [string, string][];
+  platform: string;
+  cleanupId: string;
+  mirrors?: string[];
+  /** 重新取链上下文（仅夸克）：恢复/失败重试时按它重新取直链 */
+  fetchCtx?: string;
+}
+
+/** 原画边下边播结果 */
+export interface PlayResult {
+  playUrl: string;
+  id: string;
+  player: string;
+}
+
+export interface DownloadTask {
+  id: number;
+  gid: string;
+  url: string;
+  fileName: string;
+  platform: string;
+  totalSize: number;
+  downloadedSize: number;
+  speed: number;
+  status: number;
+  errorMsg: string;
+  savePath: string;
+  createTime: number;
+}
+
+/** 下载任务 Dashboard 详情（对齐 Rust DownloadDetail） */
+export interface DownloadDetail {
+  id: number;
+  gid: string;
+  url: string;
+  fileName: string;
+  platform: string;
+  totalSize: number;
+  downloadedSize: number;
+  speed: number;
+  status: number;
+  errorMsg: string;
+  savePath: string;
+  createTime: number;
+  connections: number;
+  uploadSpeed: number;
+  totalTime: number;
+}
+
+export interface Bookmark {
+  id: number;
+  link: string;
+  title: string;
+  platform: string;
+  pwd: string;
+  category: string;
+  createTime: number;
+}
+
+export interface ResolveHistory {
+  id: number;
+  link: string;
+  title: string;
+  platform: string;
+  createTime: number;
+}
+
+export interface XunleiLoginStep {
+  needSms: boolean;
+  creditKey: string;
+  smsToken: string;
+  sessionId: string;
+  nickname: string;
+  reviewUrl: string;
+  message: string;
+}
+
+export interface LogRow {
+  id: number;
+  time: number;
+  level: string;
+  platform: string;
+  action: string;
+  message: string;
+  detail: string;
+}
+
+export interface LoginSuccessEvent {
+  platform: string;
+  nickname: string;
+}
+
+/** 剪贴板命中分享链接事件（对齐 Rust clipboard 模块发射） */
+export interface ClipboardShareEvent {
+  text: string;
+  parsed: { platform: string; shareId: string; pwd: string };
+  at: number;
+}
+
+/** 在线更新检查结果（对齐 Rust UpdateInfo） */
+export interface UpdateInfo {
+  hasUpdate: boolean;
+  currentVersion: string;
+  latestVersion: string;
+  name: string;
+  notes: string;
+  downloadUrl: string;
+  browserDownloadUrl: string;
+}
+
+/** 安装包下载进度（`update:progress` 事件） */
+export interface UpdateProgress {
+  received: number;
+  total: number;
+}
+
+// ---------- 下载统计 ----------
+
+export interface StatsTotals {
+  files: number;
+  bytes: number;
+  failed: number;
+}
+
+/** 单日聚合（day = "YYYY-MM-DD"，本地时区） */
+export interface StatsDaily {
+  day: string;
+  files: number;
+  bytes: number;
+  failed: number;
+}
+
+export interface StatsPlatform {
+  platform: string;
+  files: number;
+  bytes: number;
+  failed: number;
+}
+
+export interface StatsOverview {
+  totals: StatsTotals;
+  daily: StatsDaily[];
+  platforms: StatsPlatform[];
+}
+
+// ---------- 订阅追剧 ----------
+
+/** 订阅条目（对齐 Rust SubscriptionRow） */
+export interface Subscription {
+  id: number;
+  keyword: string;
+  /** 优先搜索的网盘类型（JSON 数组字符串，如 ["quark","uc"]） */
+  cloudTypesJson: string;
+  /** 自定义集数过滤正则（空 = 不过滤） */
+  episodeRegex: string;
+  enabled: boolean;
+  /** 上次检查时间戳（毫秒；0 = 从未运行） */
+  lastRunAt: number;
+  /** 上次执行结果摘要 */
+  lastResult: string;
+  createTime: number;
+}
+
+// ---------- 错误规范 ----------
+
+export interface AppError {
+  code: string;
+  message: string;
+}
+
+export function errMsg(e: unknown): string {
+  if (typeof e === "string") return e;
+  const obj = e as AppError | null;
+  if (obj && typeof obj === "object" && "message" in obj) return String(obj.message);
+  return "未知错误";
+}
+
+/** update_settings 返回：设置必定已保存；engineSync* 提示下载引擎同步是否失败（非阻塞） */
+export interface UpdateSettingsResult {
+  engineSyncFailed: boolean;
+  engineSyncError: string | null;
+}
+
+// ---------- 命令封装 ----------
+
+export const ipc = {
+  getAppInfo: () => invoke<AppInfo>("get_app_info"),
+  getSettings: () => invoke<Settings>("get_settings"),
+  updateSettings: (settings: Settings) => invoke<UpdateSettingsResult>("update_settings", { settings }),
+
+  listAccounts: () => invoke<AccountSummary[]>("list_accounts"),
+  /** 平台账号列表（多账号切换下拉） */
+  listAccountRows: (platform: string) => invoke<AccountRow[]>("list_account_rows", { platform }),
+  /** 切换平台当前选中账号 */
+  switchAccount: (platform: string, key: string) =>
+    invoke<void>("switch_account", { platform, key }),
+  /** 登出（key 空 = 登出当前选中账号；Rust 侧 key 为必填 String，空串命中「登出当前账号」分支） */
+  logout: (platform: string, key?: string) => invoke<void>("logout", { platform, key: key ?? "" }),
+  /** 代理连通性测试（真实出口 IP 探测） */
+  testProxy: () => invoke<ProxyTestResult>("test_proxy"),
+  /** PanSou 服务连通性检测 */
+  pansouPing: (baseUrl: string) => invoke<PansouPingResult>("pansou_ping", { baseUrl }),
+  webLoginStart: (platform: string) => invoke<void>("web_login_start", { platform }),
+  webLoginCancel: (platform: string) => invoke<void>("web_login_cancel", { platform }),
+  xunleiLogin: (username: string, password: string) =>
+    invoke<XunleiLoginStep>("xunlei_login", { username, password }),
+  xunleiSmsLogin: (username: string, smsCode: string, creditKey: string, smsToken: string) =>
+    invoke<XunleiLoginStep>("xunlei_sms_login", { username, smsCode, creditKey, smsToken }),
+  pan123Login: (account: string, password: string) =>
+    invoke<string>("pan123_login", { account, password }),
+
+  resolveShare: (text: string, pwdOverride?: string) =>
+    invoke<ResolveSessionInfo>("resolve_share", { text, pwdOverride: pwdOverride || null }),
+  /** 仅识别链接（平台 + 分享 id + 提取码），不建会话；批量队列用 */
+  parseShare: (text: string) => invoke<ParsedShare>("parse_share_link", { text }),
+
+  pansouSearch: (kw: string, cloudTypes?: string[]) =>
+    invoke<SearchItem[]>("pansou_search", { kw, cloudTypes }),
+  listShareFiles: (sessionKey: string, dirId: string, page?: number) =>
+    invoke<ShareFilePage>("list_share_files", { sessionKey, dirId, page }),
+  collectFolderFiles: (sessionKey: string, dirId: string) =>
+    invoke<CollectedFile[]>("collect_folder_files", { sessionKey, dirId }),
+  getDownloadLink: (sessionKey: string, file: ShareFile) =>
+    invoke<DownloadLink>("get_download_link", { sessionKey, file }),
+
+  listPersonalFiles: (platform: string, dirId?: string) =>
+    invoke<ShareFile[]>("list_personal_files", { platform, dirId }),
+  getPersonalDownloadLink: (platform: string, file: ShareFile) =>
+    invoke<DownloadLink>("get_personal_download_link", { platform, file }),
+
+  /** 分享文件原画边下边播（GeZi 本地代理 + VLC） */
+  playShareFile: (sessionKey: string, file: ShareFile) =>
+    invoke<PlayResult>("play_share_file", { sessionKey, file }),
+  /** 个人云文件原画边下边播 */
+  playPersonalFile: (platform: string, file: ShareFile) =>
+    invoke<PlayResult>("play_personal_file", { platform, file }),
+
+  enqueueDownload: (
+    url: string,
+    fileName: string,
+    headers: [string, string][],
+    platform: string,
+    cleanupId?: string,
+    mirrors?: string[],
+    fetchCtx?: string,
+  ) =>
+    invoke<number>("enqueue_download", {
+      url,
+      fileName,
+      headers,
+      platform,
+      cleanupId,
+      mirrors,
+      fetchCtx,
+    }),
+  enqueueTorrent: (torrentData: number[], fileName: string) =>
+    invoke<number>("enqueue_torrent", { torrentData, fileName }),
+  enqueueTorrentFile: (filePath: string) =>
+    invoke<number>("enqueue_torrent_file", { filePath }),
+  pauseDownload: (id: number) => invoke<void>("pause_download", { id }),
+  resumeDownload: (id: number) => invoke<void>("resume_download", { id }),
+  pauseAllDownloads: () => invoke<void>("pause_all_downloads"),
+  resumeAllDownloads: () => invoke<void>("resume_all_downloads"),
+  removeDownloadTask: (id: number, deleteLocal: boolean) =>
+    invoke<void>("remove_download_task", { id, deleteLocal }),
+  listDownloadTasks: () => invoke<DownloadTask[]>("list_download_tasks"),
+  clearDownloadTasks: () => invoke<void>("clear_download_tasks"),
+  getDownloadDetail: (id: number) => invoke<DownloadDetail>("download_detail", { id }),
+  /** 下载统计总览（独立聚合表，清空任务记录不影响） */
+  getDownloadStats: (days?: number) => invoke<StatsOverview>("get_download_stats", { days }),
+
+  listBookmarks: () => invoke<Bookmark[]>("list_bookmarks"),
+  addBookmark: (link: string, title: string, pwd: string) =>
+    invoke<number>("add_bookmark", { link, title, pwd }),
+  removeBookmark: (id: number) => invoke<void>("remove_bookmark", { id }),
+
+  listResolveHistory: () => invoke<ResolveHistory[]>("list_resolve_history"),
+  deleteResolveHistory: (id: number) => invoke<void>("delete_resolve_history", { id }),
+  clearResolveHistory: () => invoke<void>("clear_resolve_history"),
+
+  listLogs: (level?: string, limit?: number) =>
+    invoke<LogRow[]>("list_logs", { level, limit }),
+  clearLogs: () => invoke<void>("clear_logs"),
+
+  listSubscriptions: () => invoke<Subscription[]>("list_subscriptions"),
+  addSubscription: (keyword: string, cloudTypes?: string[], episodeRegex?: string) =>
+    invoke<number>("add_subscription", { keyword, cloudTypes, episodeRegex }),
+  updateSubscription: (
+    id: number,
+    enabled: boolean,
+    keyword: string,
+    cloudTypes?: string[],
+    episodeRegex?: string,
+  ) =>
+    invoke<void>("update_subscription", { id, enabled, keyword, cloudTypes, episodeRegex }),
+  removeSubscription: (id: number) => invoke<void>("remove_subscription", { id }),
+  runSubscriptionNow: (id: number) => invoke<string>("run_subscription_now", { id }),
+
+  testBaiduSpeedService: (baseUrl?: string, password?: string) =>
+    invoke<BaiduSpeedCheckResult>("test_baidu_speed_service", {
+      baseUrl: baseUrl || null,
+      password: password || null,
+    }),
+};
+
+export interface BaiduSpeedCheckResult {
+  reachable: boolean;
+  latencyMs: number;
+  status: "ok" | "invalid_key" | "warn" | "error";
+  message: string;
+}
+
+// ---------- 事件订阅 ----------
+
+export function onDownloadsUpdated(handler: (tasks: DownloadTask[]) => void): Promise<UnlistenFn> {
+  return listen<DownloadTask[]>("downloads:updated", (e) => handler(e.payload));
+}
+
+export function onLoginSuccess(handler: (e: LoginSuccessEvent) => void): Promise<UnlistenFn> {
+  return listen<LoginSuccessEvent>("login:success", (e) => handler(e.payload));
+}
+
+export function onUpdateProgress(handler: (p: UpdateProgress) => void): Promise<UnlistenFn> {
+  return listen<UpdateProgress>("update:progress", (e) => handler(e.payload));
+}
+
+export function onClipboardShare(
+  handler: (e: ClipboardShareEvent) => void
+): Promise<UnlistenFn> {
+  return listen<ClipboardShareEvent>("clipboard:share-detected", (e) => handler(e.payload));
+}
+
+/** 设置保存后通知（导航胶囊「搜索」显隐等即时生效） */
+export function onSettingsUpdated(handler: (s: Settings) => void): Promise<UnlistenFn> {
+  return listen<Settings>("settings:updated", (e) => handler(e.payload));
+}
