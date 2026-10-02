@@ -23,7 +23,7 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 9.15.9
 
       - name: Setup Rust (MSVC)
         uses: dtolnay/rust-toolchain@stable
@@ -36,7 +36,7 @@ jobs:
           workspaces: src-tauri
 
       - name: Install frontend deps
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --config.confirmModulesPurge=false
 
       - name: Build Tauri (NSIS + MSI)
         run: pnpm tauri build

@@ -1,2 +1,6 @@
+packages:
+  - "."
+
+# pnpm 10.26+ / 12：允许 esbuild 安装脚本
 allowBuilds:
   esbuild: true
